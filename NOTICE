@@ -1,0 +1,65 @@
+ComfyUI-DiffHDR
+Copyright 2026 BeeeFX
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product includes software developed by third parties. Licenses and attribution
+below, as required by Apache License 2.0 Section 4(d).
+
+────────────────────────────────────────────────────────────────────────────────
+Redistributed source (vendored in this repository)
+────────────────────────────────────────────────────────────────────────────────
+
+DiffHDR — "Re-Exposing LDR Videos with Video Diffusion Models"
+  Eyeline Labs
+  https://github.com/Eyeline-Labs/DiffHDR
+  License:      Apache License 2.0
+  License text: ./DiffHDR/LICENSE
+  Pinned commit: cfc1b48bdf42e07e75ef3e360d2d1a6dd27403d0
+  Vendored at:  ./DiffHDR/
+  Modifications: itemised in ./DiffHDR/VENDORED.md
+
+  The vendored ./DiffHDR/diffsynth/ tree is itself derived from DiffSynth-Studio
+  (https://github.com/modelscope/DiffSynth-Studio), also Apache License 2.0, and was
+  modified by the DiffHDR authors before we vendored it.
+
+────────────────────────────────────────────────────────────────────────────────
+Derived source (ported, not copied verbatim)
+────────────────────────────────────────────────────────────────────────────────
+
+./diffhdr_runtime/colour.py
+  The colour transfer functions and exposure-mask detection are ported from DiffHDR's
+  utils/color_utils.py and infer_hdri.py (Apache License 2.0, as above). They are
+  re-expressed for ComfyUI's IMAGE tensor layout but are numerically identical to the
+  originals; tests/test_colour_parity.py asserts this against the vendored copies.
+
+./diffhdr_runtime/windows.py
+  The sliding-window schedule and temporal blend ramp are ported from DiffHDR's
+  infer_long_video.py (Apache License 2.0, as above).
+
+────────────────────────────────────────────────────────────────────────────────
+Runtime dependencies (NOT redistributed by this repository)
+────────────────────────────────────────────────────────────────────────────────
+
+Wan2.1-VACE-14B model weights
+  Alibaba / Wan-AI — https://huggingface.co/Wan-AI/Wan2.1-VACE-14B
+  Subject to the Wan2.1 license published with the weights. Obtained by the user;
+  no weights are included here.
+
+DiffHDR LoRA weights (DiffHDR.safetensors, DiffHDR_Pano.safetensors)
+  https://huggingface.co/ZhengmingYu/DiffHDR
+  Subject to the license published with the weights. Obtained by the user.
+
+umt5-xxl tokenizer and text encoder
+  Google / Wan-AI, distributed inside the Wan2.1 repositories. Obtained by the user.
+
+PyTorch, transformers, safetensors, einops, peft, ftfy, huggingface_hub
+  Installed via pip; each under its own license.
+
+────────────────────────────────────────────────────────────────────────────────
+Reference only — no code copied
+────────────────────────────────────────────────────────────────────────────────
+
+ComfyUI-BAT-UniVidX and ComfyUI-DKTWrapper (https://github.com/BeeeFX) informed the
+structure of this pack — vendoring policy, single-entry model cache, loader/worker
+split — but no code was taken from either.

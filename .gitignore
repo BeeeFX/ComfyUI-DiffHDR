@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+
+# Model weights never belong in the repo. They are resolved through ComfyUI's
+# folder_paths at runtime -- see the model table in README.md.
+*.safetensors
+*.pth
+*.ckpt
+*.bin
+
+# NOTE: DiffHDR/ is deliberately NOT ignored. The upstream tree is vendored and
+# committed rather than cloned on first run. A runtime clone does not survive a deploy
+# that mirrors directories (`rsync --delete` and friends): it gets wiped while leaving
+# enough behind that a naive "is it present?" check still passes, and the loader then
+# fails with a confusing ImportError. Vendoring makes an install self-contained.
+# See DiffHDR/VENDORED.md.

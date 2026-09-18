@@ -1,0 +1,29 @@
+# ComfyUI-DiffHDR dependencies.
+#
+# Almost everything the vendored pipeline needs, ComfyUI already pins: torch,
+# torchvision, transformers, safetensors, einops, sentencepiece, numpy, Pillow,
+# tqdm, typing_extensions. None of those are listed here, so pip cannot renegotiate
+# their versions and break another custom node.
+#
+# Do NOT install upstream DiffHDR's own requirements.txt. It pins python 3.10,
+# torch 2.6.0 and numpy==1.26.4, none of which match a current ComfyUI environment,
+# and most of it (accelerate, pandas, pyexr, pyiqa, pyfvvdp, pytorch-fid) belongs to
+# the training and evaluation code that this pack does not vendor.
+#
+# huggingface_hub<1.0 is mandatory, not cosmetic: transformers refuses to import
+# against hf_hub 1.x. Same lesson as the DKT and UniVidX wrappers in this suite.
+huggingface_hub<1.0
+
+# Text-encoder prompt cleanup (diffsynth/prompters/wan_prompter.py).
+ftfy
+regex
+
+# LoRA merge path. Usually already present via other packs.
+peft
+
+# NOT required, despite appearing in upstream imports:
+#   modelscope    -- only used to download models; every import of it is deferred and
+#                    this pack always resolves explicit local paths (VENDORED.md).
+#   flash_attn    -- optional speedup; diffsynth falls back to torch SDPA cleanly.
+#   pyexr / OpenEXR -- upstream's scripts write EXR themselves. This pack returns an
+#                    IMAGE and leaves writing to your own saver.
