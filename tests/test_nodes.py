@@ -220,6 +220,29 @@ ck("tea_cache model id is the 14B one", fp.seen["tea_cache_model_id"] == "Wan2.1
 ck("seed defaults to a fixed control, so re-queues hit the cache",
    nodes.DiffHDRSample.INPUT_TYPES()["required"]["seed"][1].get("control_after_generate") == "fixed")
 
+print("Sample logs tokens, time and peak VRAM per pass on CUDA (stubbed: no GPU here)")
+import logging  # noqa: E402
+
+records = []
+handler = logging.Handler()
+handler.emit = lambda r: records.append(r.getMessage())
+nodes.logger.addHandler(handler)
+_saved = (nodes._on_cuda, torch.cuda.reset_peak_memory_stats,
+          torch.cuda.max_memory_allocated, torch.cuda.get_device_properties)
+try:
+    nodes._on_cuda = lambda device: True
+    torch.cuda.reset_peak_memory_stats = lambda device=None: None
+    torch.cuda.max_memory_allocated = lambda device=None: 17 * 2**30
+    torch.cuda.get_device_properties = lambda device=None: type("P", (), {"total_memory": 24 * 2**30})()
+    smp._run(FakePipe(), cond2["log_video"], cond2["masks"], None, "", "", 2, 1.0, 7, 5.0,
+             32, 48, 5, True, label="probe")
+finally:
+    (nodes._on_cuda, torch.cuda.reset_peak_memory_stats,
+     torch.cuda.max_memory_allocated, torch.cuda.get_device_properties) = _saved
+    nodes.logger.removeHandler(handler)
+ck("tokens logged", any("(12 tokens)" in r for r in records), str(records[:1]))
+ck("peak VRAM logged", any("peak VRAM 17.0 of 24.0 GiB" in r for r in records), str(records[-1:]))
+
 print("Sample: a still is replicated to the trained token count, capped by window_size")
 still, *_ = enc.encode(torch.rand(1, 720, 1280, 3), "video", 1280, 720, "crop_and_resize",
                        0.95, 0.01, False, 0.02, True)

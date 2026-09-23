@@ -8,7 +8,7 @@ Exits non-zero if any suite fails. No GPU and no model weights are required.
 Two suites need to be run from inside a ComfyUI install (they import folder_paths):
 test_model_scan and test_nodes. From a bare clone of this repo they are skipped, and
 the rest -- the colour parity checks, the LoRA merge arithmetic, the window
-scheduling and the pipeline cache -- run anywhere torch is available.
+scheduling, the VRAM dtypes and the pipeline cache -- run anywhere torch is available.
 """
 
 import os
@@ -28,6 +28,8 @@ SUITES = [
      "all three LoRA encodings, and that DiffHDR + a speed LoRA stay disjoint"),
     ("windows", "test_windows.py",
      "sliding-window scheduling and the temporal blend ramp"),
+    ("vram dtypes", "test_vram_dtypes.py",
+     "DiT and VACE resident in their own dtype (the vendored VACE fp32-upcast fix)"),
     ("runtime", "test_runtime.py",
      "one resident pipeline, freed for real, rebuilt on demand after eviction"),
     ("nodes", "test_nodes.py",

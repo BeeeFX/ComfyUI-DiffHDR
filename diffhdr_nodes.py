@@ -103,6 +103,10 @@ def _crop_and_resize(image: torch.Tensor, height: int, width: int, mode: str) ->
     return x.permute(0, 2, 3, 1).contiguous()
 
 
+def _on_cuda(device) -> bool:
+    return torch.cuda.is_available() and str(device).startswith("cuda")
+
+
 def _mask_to_pil(mask_hw: torch.Tensor) -> Image.Image:
     """[H,W] float -> 3-channel uint8 PIL, the form diffsynth's VACE unit expects.
 
@@ -181,16 +185,22 @@ class DiffHDRLoadModel:
                                "distillation is flattening the recovered highlights."}),
                 "dit_dtype": (DIT_DTYPES,
                     {"default": "bf16", "tooltip":
-                    "Load precision for the DiT. bf16 is the reference (~34 GB); "
-                    "fp8_e4m3fn roughly halves that (~17 GB) by casting on load and is "
-                    "the practical choice on a 24-32 GB card. Note this casts the fp16 "
+                    "Load precision for the DiT + VACE weights. bf16 is the reference "
+                    "(32.3 GiB); fp8_e4m3fn halves that (16.2 GiB) by casting on load and "
+                    "is the practical choice on a 24-32 GB card. Note this casts the fp16 "
                     "file -- pre-quantised '_fp8_scaled' repacks carry extra scale "
-                    "tensors that diffsynth cannot identify, and are rejected."}),
+                    "tensors that diffsynth cannot identify, and are rejected.\n\n"
+                    "fp16 saves nothing: computation is bf16 regardless, so it is "
+                    "bit-identical to bf16 bar a sub-ULP difference on LoRA-merged "
+                    "layers, and costs a cast per layer per step. Use bf16."}),
                 "vram_mode": (["auto", "full_gpu", "streaming"], {"default": "auto", "tooltip":
-                    "auto: upstream's default -- budget from total VRAM and stream DiT "
-                    "blocks from system RAM.\n"
-                    "full_gpu: keep everything resident. Fastest, needs the whole DiT in "
-                    "VRAM.\n"
+                    "auto: upstream's default -- keep blocks on the GPU until it is nearly "
+                    "full, stream the rest from system RAM every step. Blocks kept on the "
+                    "GPU are upcast to bf16 whatever dit_dtype is.\n"
+                    "full_gpu: keep every weight resident in the loaded dtype and never "
+                    "stream. Fastest. At fp8 that is 16.2 GiB of weights -- expected to fit "
+                    "a 24 GB card at ~11k tokens per pass, not yet measured. Sample logs "
+                    "peak VRAM per pass.\n"
                     "streaming: same as auto but with an explicit budget from "
                     "vram_limit_gb, for sharing a card."}),
                 "vram_limit_gb": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 512.0, "step": 0.5,
@@ -679,9 +689,15 @@ class DiffHDRSample:
                 yield item
             pbar.update_absolute(offset + steps, total)
 
+        # Tokens per pass is what decides whether a job fits (README, "What fits"); a
+        # reference image adds one latent frame.
+        tokens = ((num_frames - 1) // 4 + 1 + (ref is not None)) * (height // 16) * (width // 16)
+        on_cuda = _on_cuda(pipe.device)
+        if on_cuda:
+            torch.cuda.reset_peak_memory_stats(pipe.device)
         t0 = time.perf_counter()
-        logger.info("ComfyUI-DiffHDR: sampling %s -- %d frames at %dx%d, %d steps",
-                    label, num_frames, width, height, steps)
+        logger.info("ComfyUI-DiffHDR: sampling %s -- %d frames at %dx%d (%d tokens), %d steps",
+                    label, num_frames, width, height, tokens, steps)
 
         with torch.inference_mode():
             video = pipe(
@@ -710,7 +726,15 @@ class DiffHDRSample:
 
         out = torch.stack(video)                 # (T,H,W,C), log space, unquantised
         out = torch.clamp_min(out, 0.0).float()  # upstream clamps the floor only
-        logger.info("ComfyUI-DiffHDR: %s done in %.1f s", label, time.perf_counter() - t0)
+        elapsed = time.perf_counter() - t0
+        if on_cuda:
+            # Measured, so the README's VRAM tables can be checked on any card by just
+            # running a job -- e.g. whether vram_mode=full_gpu fits.
+            logger.info("ComfyUI-DiffHDR: %s done in %.1f s, peak VRAM %.1f of %.1f GiB",
+                        label, elapsed, torch.cuda.max_memory_allocated(pipe.device) / 2**30,
+                        torch.cuda.get_device_properties(pipe.device).total_memory / 2**30)
+        else:
+            logger.info("ComfyUI-DiffHDR: %s done in %.1f s", label, elapsed)
         return out
 
     @staticmethod

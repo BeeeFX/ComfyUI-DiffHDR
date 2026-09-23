@@ -20,8 +20,9 @@ a private module name by `../diffhdr_runtime/vendor.py` — see that file for wh
 
 ## Modifications to the upstream copy
 
-Apache-2.0 §4(b) requires these be stated. They are the minimum needed to make the
-package import inside ComfyUI; **no model, sampling or colour logic has been changed.**
+Apache-2.0 §4(b) requires these be stated. Items 1-4 are the minimum needed to make the
+package import inside ComfyUI; item 5 is a memory bug fix. **No model, sampling or
+colour logic has been changed**, and no output changes.
 
 1. **Removed directories** (not needed for inference, and each pulled in dependencies
    this pack would otherwise have to require):
@@ -59,6 +60,19 @@ package import inside ComfyUI; **no model, sampling or colour logic has been cha
    Without this, `modelscope` — a large package — would be a hard install requirement
    for functionality this pack never uses.
 
+5. **VACE kept in its own dtype under VRAM management** —
+   `diffsynth/pipelines/wan_video_new.py`, `WanVideoPipeline.enable_vram_management`, one
+   line (marked `[ComfyUI-DiffHDR]`). Upstream's VACE section passes `dtype` as VACE's
+   offload/onload dtype without setting it, so it silently inherits whatever the
+   *previous* section assigned — the VAE's. This pack loads the VAE in fp32, so VACE was
+   upcast to fp32 on every onload: for Wan2.1-VACE-14B, 11.4 GiB instead of 2.8 GiB at
+   fp8 (5.7 GiB at bf16), in system RAM under `auto` and on the GPU under `full_gpu`.
+   That is what kept `full_gpu` + fp8 at 24.7 GiB of weights, over a 24 GB card; fixed
+   it is 16.2 GiB. The upcast was lossless (fp8 and bf16 both widen exactly to fp32 and
+   are cast back to bf16 to compute), so outputs are bit-identical before and after.
+   Current DiffSynth-Studio has since replaced this whole VRAM subsystem, so there is no
+   upstream fix to take. `tests/test_vram_dtypes.py` fails if a re-vendor drops this.
+
 No other file has been edited.
 
 ---
@@ -85,6 +99,9 @@ sed -i 's/^from utils\.color_utils import/from ..diffhdr_utils.color_utils impor
     DiffHDR/diffsynth/models/wan_video_colour_transoform.py
 sed -i 's/^from utils\.token_utils import/from ..diffhdr_utils.token_utils import/' \
     DiffHDR/diffsynth/pipelines/wan_video_new.py
+# and re-apply edit 5 by hand: in enable_vram_management, first line of the
+# `if self.vace is not None:` block:
+#     dtype = next(iter(self.vace.parameters())).dtype
 ```
 
 Then bump the commit above and run the test suite. `tests/test_colour_parity.py`

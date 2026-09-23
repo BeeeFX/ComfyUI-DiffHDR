@@ -119,14 +119,29 @@ DiffHDR already runs at `cfg_scale` 1.0.
 
 ### Fitting it on your card
 
-| `dit_dtype` | DiT size | Notes |
+| `dit_dtype` | DiT + VACE weights | Notes |
 |---|---|---|
-| `bf16` | ~34 GB | Reference behaviour. |
-| `fp8_e4m3fn` | ~17 GB | Casts the fp16 file on load. The practical choice on 24–32 GB. |
+| `bf16` | 32.3 GiB | Reference behaviour. |
+| `fp8_e4m3fn` | 16.2 GiB | Casts the fp16 file on load. The practical choice on 24–32 GB. |
+| `fp16` | 32.3 GiB | No saving: computation is bf16 regardless, so this is bit-identical to `bf16` except for a sub-ULP difference on LoRA-merged layers, plus a cast per layer per step. Use `bf16`. |
 
-`vram_mode` is separate: `auto` (stream DiT blocks from system RAM — works nearly
-everywhere), `full_gpu` (all resident, fastest), `streaming` (explicit budget via
-`vram_limit_gb`).
+(Parameter counts from the model definitions: DiT 14.29 B, VACE 3.05 B.)
+
+`vram_mode` is separate: `auto` (keep blocks on the GPU until it is nearly full, stream
+the rest from system RAM every step — works nearly everywhere), `full_gpu` (all
+resident, never streams), `streaming` (explicit budget via `vram_limit_gb`). Blocks
+`auto` keeps on the GPU are upcast to bf16 whatever `dit_dtype` says; `full_gpu` keeps
+them in the loaded dtype and casts each layer to bf16 as it runs.
+
+**`full_gpu` + fp8 on a 24 GB card — expected to fit since 0.2.0, not yet measured.**
+Before 0.2.0 it could not fit at all: a bug in the vendored diffsynth held the
+3 B-parameter VACE branch in fp32 (11.4 GiB), putting fp8 at 24.7 GiB of weights. That is
+fixed (`DiffHDR/VENDORED.md`, item 5) with bit-identical output, leaving 16.2 GiB of
+weights and ~7 GiB for activations. It could also be much faster than `auto`: the timings
+below work out to ~14 s per extra step at 3,120 tokens (147 s at 10 steps, 61 s at 4),
+where the arithmetic alone should take ~2 s on an A5000 — so most of each `auto` step is
+moving weights, which `full_gpu` never does. The Sample node logs peak VRAM and time per
+pass, so one run with `vram_mode = full_gpu` settles it.
 
 The VAE always runs fp32. It is small, runs once, and carries the log signal back out.
 
@@ -261,7 +276,7 @@ What this pack already does:
 
 | | |
 |---|---|
-| **fp8 weights** | `dit_dtype=fp8_e4m3fn` halves the DiT (~34 → ~17 GB). Measured safe for this LoRA (see above). |
+| **fp8 weights** | `dit_dtype=fp8_e4m3fn` halves the weights (32.3 → 16.2 GiB). Measured safe for this LoRA (see above). |
 | **DiT block streaming** | `vram_mode`. Weights are not the binding constraint at 24 GB; activations are. |
 | **Tiled VAE** | On by default. |
 | **Prompt-embedding cache** | DiffHDR runs a constant (empty) prompt, but the pipeline re-encoded it every job *and* swapped the 11 GB T5 onto the GPU to do so. Now cached at the unit level, so both are skipped after the first run. |
@@ -292,9 +307,9 @@ assumption here and was wrong: dynamo specialises on the offload state and guard
 lengths dynamically. The reasons for leaving it are weaker than a measurement: a 14 B
 transformer at 10<sup>4</sup> tokens is dominated by large matmuls that are already near
 peak, so compile's usual wins (fusing elementwise work, cutting launch overhead) have
-little to bite on; warmup across 40 blocks is minutes; and `full_gpu`, the mode with the
-fewest moving parts to compile, does not fit on 24 GB anyway. Worth revisiting on a
-48 GB+ card, where it can be tested properly.
+little to bite on; and warmup across 40 blocks is minutes. `full_gpu`, the mode with
+the fewest moving parts to compile, did not fit on 24 GB until the VACE fix in 0.2.0;
+worth revisiting once it has been measured there.
 
 **TeaCache — implemented, off by default, and underwhelming here.** It is exposed as
 `tea_cache` on the Sample node. Measured, 5 frames at 832×480, 10 steps:
@@ -386,6 +401,10 @@ either fail or shadow ComfyUI core for every other node in the process. Separate
 eager `modelscope` imports were deferred, so a large download-only dependency is not
 required for functionality this pack never uses.
 
+**One memory bug was fixed**, also itemised there: diffsynth's VRAM management gave the
+VACE branch the VAE's dtype (fp32 here) instead of its own. One line; outputs are
+bit-identical, the saving is 8.5 GiB at fp8.
+
 No model, sampling or colour logic in the vendored tree has been changed.
 
 ---
@@ -394,8 +413,9 @@ No model, sampling or colour logic in the vendored tree has been changed.
 
 Working and measured, but young — first public release. The numbers throughout this
 README were taken on a single 24 GB RTX A5000; if you run it on other hardware I would
-be glad to hear what you get, particularly on 48 GB+ cards where `full_gpu` becomes
-viable and `torch.compile` is worth retesting.
+be glad to hear what you get — particularly `full_gpu` at fp8 on a 24 GB card, which
+should fit since 0.2.0 but has not been measured, and 48 GB+ cards where
+`torch.compile` is worth retesting.
 
 Known rough edges, all documented above rather than hidden: TeaCache barely engages
 because upstream's coefficient table has no VACE entry; SageAttention is not worth it on

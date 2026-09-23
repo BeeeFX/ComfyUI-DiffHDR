@@ -45,6 +45,10 @@ Changelog
             final `mask` output; seed defaults to fixed; one progress bar per job;
             ComfyUI's models are unloaded before sampling; antialiased downscale;
             Encode works a frame at a time (same result, far lower peak RAM).
+            Vendored fix: diffsynth's VRAM management gave VACE the VAE's dtype, so
+            VACE sat in fp32 (11.4 GiB instead of 2.8 at fp8) -- the reason
+            full_gpu + fp8 needed 24.7 GiB of weights; now 16.2. Output
+            bit-identical. Sample logs tokens and peak VRAM per pass.
 """
 
 import logging
