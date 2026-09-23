@@ -38,9 +38,9 @@ figure is for a fresh checkout in diffsynth's own layout; it is not required her
 | Display name | Category | What it does |
 |---|---|---|
 | **DiffHDR Load Model** | `DiffHDR` | Loads the Wan2.1-VACE-14B backbone, umt5 encoder, VAE and a DiffHDR LoRA into one cached pipeline. Validates every checkpoint from its safetensors header *before* loading, because several plausibly-named Wan files do not work and the resulting failure is otherwise obscure and minutes deep. Handles precision (`bf16`/`fp8`) and VRAM strategy. Errors — rather than warns — if the LoRA merges into nothing, since that silently yields ordinary Wan video. |
-| **DiffHDR Encode** | `DiffHDR` | Conforms the plate, detects over/under-exposed regions, and converts sRGB → linear → DiffHDR's log curve. A separate node because the masks are the real creative control: they decide what gets reinvented. Both come out as `MASK` so you can see them. |
+| **DiffHDR Encode** | `DiffHDR` | Conforms the plate, detects over/under-exposed regions, and converts sRGB → linear → DiffHDR's log curve. A separate node because the masks are the real creative control: they decide what gets reinvented. They come out as `MASK` so you can see them, and an optional `mask` input lets you add to, subtract from or replace the detection. |
 | **DiffHDR Sample** | `DiffHDR` | Runs the diffusion pass and returns unclamped scene-linear frames. Covers all four upstream entry points — stills, 33-frame clips, long clips via overlapping windows, and HDRI panoramas — choosing between them from what you feed it rather than from a mode widget. Real per-step progress and working cancellation. |
-| **DiffHDR Free Memory** | `DiffHDR` | Releases the cached pipeline. Rarely needed; the loader already holds at most one. |
+| **DiffHDR Free Memory** | `DiffHDR` | Releases the cached pipeline. Rarely needed; the loader already holds at most one. Wire Sample's output through it so it runs after sampling; the next run reloads automatically. |
 
 Each node has a help page in the ComfyUI node-help panel (`web/docs/`).
 
@@ -201,17 +201,19 @@ empty.
 
 The node only really has one dial worth turning: **`over_threshold` on Encode**. Lower
 it if genuinely clipped highlights are being left alone; raise it if bright-but-intact
-areas are being rebuilt with invented detail. Look at the `over_mask` output while you
-do it.
+areas are being rebuilt with invented detail. Look at the `mask` output while you
+do it (the example workflows already preview it), and connect your own `MASK` to Encode
+for the cases detection gets wrong — `add` for missed clipping, `subtract` to protect
+bright detail that is intact.
 
 ### Four jobs, no mode widget
 
 | You feed it | It does |
 |---|---|
-| one image | replicates to the trained token count (33 frames at 1280×720, fewer at higher res) and returns frame 0 — upstream's `infer_image.py` behaviour |
+| one image | replicates to the trained token count (33 frames at 1280×720, fewer at higher res), capped at `window_size`, and returns frame 0 — upstream's `infer_image.py` behaviour |
 | ≤ `window_size` frames | one pass |
 | > `window_size` frames | overlapping windows, cross-faded in linear space (see below) |
-| one image, Encode `mode=panorama` + `DiffHDR_Pano` LoRA | a single genuine frame at 2048×1024 |
+| Encode `mode=panorama` + `DiffHDR_Pano` LoRA | each image as a single genuine frame at 2048×1024 — a batch is processed one panorama at a time |
 
 ### Long clips
 
@@ -329,7 +331,7 @@ slicing `vace_context` on the latent-time axis in step with the latents.
 
 ## Verifying
 
-Four suites, none needing a GPU or weights:
+Six suites, none needing a GPU or weights:
 
 ```bash
 cd ComfyUI
@@ -343,7 +345,15 @@ If it ever fails, the output has stopped being DiffHDR while still looking plaus
 
 `test_model_scan.py` checks the header pre-flight against your actual asset library:
 that the right files are accepted, the known-bad ones rejected, and that the hash
-implementation still agrees with the vendored original.
+implementation still agrees with the vendored original. It also checks that the loader
+dropdowns list each file once and that the tokenizer is found through
+`extra_model_paths.yaml` folders and symlinks.
+
+`test_nodes.py` drives Encode and Sample (with a stand-in pipeline) and checks the
+shipped example workflows line up widget-for-widget with what the frontend builds —
+the same layout in the classic and Nodes 2.0 renderers. `test_runtime.py` checks that
+the one-pipeline cache really frees memory and that a released pipeline is rebuilt on
+demand. Two suites need a ComfyUI install and are skipped from a bare clone.
 
 Sampling itself needs weights and a GPU, so it is not in the suite. It has been verified
 by hand on an RTX A5000: a 5-frame clip, a 13-frame clip across two overlapping windows,

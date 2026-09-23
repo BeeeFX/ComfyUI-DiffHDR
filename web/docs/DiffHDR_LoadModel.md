@@ -99,6 +99,11 @@ two 14 B models are never resident at once. Changing any widget rebuilds it. Tha
 includes `lora_strength`, because the LoRA is merged into the weights rather than
 applied as a patch.
 
+Two Load Model nodes in one graph (say, the video and the Pano LoRA) therefore take
+turns: each Sample rebuilds its own pipeline if the other loader has taken the slot.
+That is correct but costs a full load each time, so prefer one loader per graph. The
+same automatic rebuild happens after DiffHDR Free Memory.
+
 ## If the LoRA fails to attach
 
 This is a hard error, not a warning, and deliberately so: without the LoRA you have

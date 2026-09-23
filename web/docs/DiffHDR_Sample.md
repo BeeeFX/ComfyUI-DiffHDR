@@ -26,11 +26,12 @@ You do not choose a mode; it follows from what you feed it.
 * **Single image** — one frame in. It is replicated to match the token count the model
   was trained on (33 frames at 1280×720, fewer at higher resolutions) and frame 0 comes
   back. This is what upstream's `infer_image.py` does, and it is why a still costs about
-  as much as a clip.
+  as much as a clip. The replication is capped at `window_size`, so the setting that
+  makes clips fit your card makes stills fit too.
 * **Clip** — up to `window_size` frames, one pass.
 * **Long clip** — more than `window_size` frames: overlapping windows, cross-faded.
-* **Panorama** — a single frame with `mode=panorama` on the Encode node; runs as one
-  genuine frame.
+* **Panorama** — `mode=panorama` on the Encode node. Each frame runs as one genuine
+  frame; a batch of panoramas is processed one at a time, never as a clip.
 
 ## Settings
 
@@ -40,6 +41,11 @@ usually indistinguishable for this task at a fifth of the time. Start at 10.
 **`cfg_scale`** — leave at 1.0. That disables classifier-free guidance, which is what
 upstream uses and halves the work per step. Above 1.0 costs double and tends to
 exaggerate the invented highlights.
+
+**`seed`** — defaults to *fixed*, not randomize. A seed that changes after every run
+would make ComfyUI re-run this node — the most expensive one in the graph — every time
+you queue, even if you only changed something downstream, and would give a different
+reconstruction of the same shot each time.
 
 **`prompt`** — leave empty, normally. The task is radiance inpainting, not
 text-to-video; a prompt mostly risks steering invented highlight content away from the
@@ -91,5 +97,14 @@ log, matching upstream. On long clips it seeds the first window; after that
 
 ## Progress and cancelling
 
-The progress bar tracks real sampler steps, and Cancel takes effect within one step
-rather than at the end of the job.
+The progress bar tracks real sampler steps across the whole job — every window or
+panorama — and Cancel takes effect within one step rather than at the end of the job.
+
+## Memory
+
+Before sampling, the node asks ComfyUI to move its own models off the GPU (they are
+reloaded on demand). ComfyUI does not manage this pipeline, so it would not otherwise
+make room for it, and DiffHDR's `auto` budget is measured from free VRAM.
+
+If the pipeline was released — by DiffHDR Free Memory, or because another Load Model
+node took the single slot — it is rebuilt automatically here.

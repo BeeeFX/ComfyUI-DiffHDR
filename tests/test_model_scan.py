@@ -64,7 +64,11 @@ for rel, needle in [
             failures.append(f"{rel}: message missing {needle!r}")
 
 print("hash implementation matches the vendored original")
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+
 import torch  # noqa: E402
+from safetensors.torch import save_file  # noqa: E402
 
 from diffhdr_runtime import vendor  # noqa: E402
 
@@ -72,23 +76,64 @@ vendor.diffsynth()
 import importlib  # noqa: E402
 
 up = importlib.import_module("diffhdr_vendored_diffsynth.models.utils")
-probe = os.path.join(M, "vae/wan_2.1_vae.safetensors")
-if os.path.exists(probe):
+tmp = tempfile.mkdtemp(prefix="diffhdr_scan_")
+# A synthetic file always, so parity is checked on every install -- not only on
+# machines that happen to have one particular VAE in one particular place.
+synth = os.path.join(tmp, "synthetic.safetensors")
+save_file({"blocks.0.self_attn.q.weight": torch.zeros(4, 8), "head.bias": torch.zeros(3),
+           "patch_embedding.weight": torch.zeros(2, 3, 1, 2, 2)}, synth)
+probes = [synth] + [p for p in [os.path.join(M, "vae/wan_2.1_vae.safetensors")] if os.path.exists(p)]
+for probe in probes:
     ks = model_scan.read_key_shapes(probe)
     fake_sd = {k: torch.empty(tuple(s), dtype=torch.uint8, device="meta") for k, s in ks.items()}
     for with_shape in (True, False):
         mine = model_scan._hash(ks, with_shape)
         theirs = up.hash_state_dict_keys(fake_sd, with_shape=with_shape)
         ok = mine == theirs
-        print(f"  [{'ok ' if ok else 'FAIL'}] with_shape={with_shape}: {mine}")
+        print(f"  [{'ok ' if ok else 'FAIL'}] {os.path.basename(probe)} with_shape={with_shape}: {mine}")
         if not ok:
             failures.append(f"hash mismatch with_shape={with_shape}: {mine} vs {theirs}")
 
-print("tokenizer auto-detection")
-toks = model_scan.find_tokenizers()
-print(f"  [{'ok ' if toks else 'FAIL'}] found {len(toks)}: {toks[:2]}")
-if not toks:
-    failures.append("no umt5 tokenizer found")
+print("dropdowns list each file once")
+# Current ComfyUI maps the legacy folder names unet -> diffusion_models and
+# clip -> text_encoders; both spellings are scanned, and must not list a file twice.
+dm = os.path.join(tmp, "dm")
+os.makedirs(dm)
+save_file({"x": torch.zeros(1)}, os.path.join(dm, "diffhdr_scan_probe.safetensors"))
+folder_paths.add_model_folder_path("diffusion_models", dm)
+labels = [c for c in model_scan.list_candidates("dit") if c.endswith("diffhdr_scan_probe.safetensors")]
+ok = len(labels) == 1
+print(f"  [{'ok ' if ok else 'FAIL'}] probe listed {len(labels)}x: {labels}")
+if not ok:
+    failures.append(f"duplicate dropdown entries: {labels}")
+ok = labels and model_scan.resolve("dit", labels[0]) == os.path.join(dm, "diffhdr_scan_probe.safetensors")
+print(f"  [{'ok ' if ok else 'FAIL'}] label resolves back to the file")
+if not ok:
+    failures.append("label did not resolve")
+
+print("tokenizer search follows extra model paths and symlinks, and survives a cycle")
+lib = os.path.join(tmp, "shared_lib", "Wan2.1-VACE-14B", "google", "umt5-xxl")
+os.makedirs(lib)
+open(os.path.join(lib, "spiece.model"), "wb").close()
+linkroot = os.path.join(tmp, "linkroot")
+os.makedirs(linkroot)
+try:
+    os.symlink(os.path.join(tmp, "shared_lib"), os.path.join(linkroot, "wan"))
+    os.symlink(linkroot, os.path.join(linkroot, "loop"))
+    folder_paths.add_model_folder_path("diffhdr", linkroot)
+    toks = model_scan.find_tokenizers()
+    ok = any(os.path.realpath(t) == os.path.realpath(lib) for t in toks)
+    print(f"  [{'ok ' if ok else 'FAIL'}] found via a symlink in a registered folder: {toks}")
+    if not ok:
+        failures.append("tokenizer behind a symlink in a registered folder not found")
+except OSError as exc:  # no symlink permission (Windows without developer mode)
+    print(f"  [skip] symlinks unavailable ({exc})")
+shutil.rmtree(tmp, ignore_errors=True)
+
+print("tokenizer auto-detection on this install")
+toks = [t for t in model_scan.find_tokenizers() if not t.startswith(tmp)]
+print(f"  [{'ok ' if toks else 'skip'}] found {len(toks)}: {toks[:2]}"
+      + ("" if toks else " (none installed -- the loader will say how to fetch one)"))
 
 print()
 if failures:

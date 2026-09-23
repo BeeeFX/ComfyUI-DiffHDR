@@ -93,7 +93,13 @@ def _crop_and_resize(image: torch.Tensor, height: int, width: int, mode: str) ->
             ch = max(1, int(w / width * height))
             top = (h - ch) // 2
             x = x[:, :, top:top + ch, :]
-    x = torch.nn.functional.interpolate(x, size=(height, width), mode="bilinear", align_corners=False)
+    # Antialias when shrinking. Plain bilinear samples only the 2x2 nearest source
+    # pixels, so a 4K plate taken down to 720p aliases -- and aliasing in a blown
+    # highlight is exactly what makes the exposure mask speckle. PIL (which diffsynth's
+    # own loaders resize through) filters on downscale too.
+    shrinking = x.shape[2] > height or x.shape[3] > width
+    x = torch.nn.functional.interpolate(x, size=(height, width), mode="bilinear",
+                                        align_corners=False, antialias=shrinking)
     return x.permute(0, 2, 3, 1).contiguous()
 
 
@@ -124,8 +130,8 @@ class DiffHDRLoadModel:
     @classmethod
     def INPUT_TYPES(cls):
         # Evaluated lazily by ComfyUI. Deliberately not done at import: scanning model
-        # folders on an NFS asset library would stall every ComfyUI start.
-        model_scan.register_model_folder()
+        # folders on an NFS asset library would stall every ComfyUI start. (models/diffhdr
+        # itself is registered once, at import -- see model_scan.)
         dits = model_scan.list_candidates("dit") or ["<none found>"]
         t5s = model_scan.list_candidates("text_encoder") or ["<none found>"]
         vaes = model_scan.list_candidates("vae") or ["<none found>"]
@@ -217,8 +223,18 @@ class DiffHDREncode:
         "tune what is being reinvented."
     )
     CATEGORY = "DiffHDR"
-    RETURN_TYPES = ("DIFFHDR_COND", "MASK", "MASK")
-    RETURN_NAMES = ("conditioning", "over_mask", "under_mask")
+    # `mask` was appended after the first release; outputs are addressed by slot index
+    # in saved workflows, so new ones only ever go on the end.
+    RETURN_TYPES = ("DIFFHDR_COND", "MASK", "MASK", "MASK")
+    RETURN_NAMES = ("conditioning", "over_mask", "under_mask", "mask")
+    OUTPUT_TOOLTIPS = (
+        "Log-space plate plus inpaint masks, for DiffHDR Sample.",
+        "Detected over-exposure (blown highlights).",
+        "Detected under-exposure (crushed shadows). Only used when "
+        "use_under_exposure_mask is on.",
+        "The mask the model will actually reconstruct: the detection, combined with "
+        "your own mask if one is connected. Preview this one.",
+    )
     FUNCTION = "encode"
 
     @classmethod
@@ -264,34 +280,57 @@ class DiffHDREncode:
                     "footage: without it the mask boils frame to frame and the model is "
                     "asked to invent a slightly different region each time, which reads "
                     "as flicker in the recovered highlights. No effect on a single frame."}),
-            }
+            },
+            "optional": {
+                "mask": ("MASK", {"tooltip":
+                    "Optional hand-made mask, combined with the detection according to "
+                    "mask_mode. One mask applies to every frame; otherwise supply one "
+                    "per frame. Conformed with the same resize_mode as the images and "
+                    "binarised at 0.5, since the model was trained on binary masks."}),
+                "mask_mode": (["add", "subtract", "replace"], {"default": "add", "tooltip":
+                    "How a connected mask combines with the detected one.\n"
+                    "add: also reconstruct these regions (clipping the detector missed).\n"
+                    "subtract: protect these regions (bright but intact detail -- "
+                    "signage, speculars you want kept).\n"
+                    "replace: ignore the detection and use only this mask."}),
+            },
         }
 
     def encode(self, images, mode, width, height, resize_mode, over_threshold,
-               under_threshold, use_under_exposure_mask, softness, temporal_stabilise):
-        if width % SPATIAL_MULTIPLE or height % SPATIAL_MULTIPLE:
+               under_threshold, use_under_exposure_mask, softness, temporal_stabilise,
+               mask=None, mask_mode="add"):
+        if resize_mode != "none" and (width % SPATIAL_MULTIPLE or height % SPATIAL_MULTIPLE):
             raise ValueError(
                 f"ComfyUI-DiffHDR: width and height must be multiples of {SPATIAL_MULTIPLE} "
                 f"(got {width}x{height}). Wan2.1 patches the latent 16 pixels at a time."
             )
 
         frames = _crop_and_resize(images, height, width, resize_mode)
-        if resize_mode == "none" and (frames.shape[1] % SPATIAL_MULTIPLE or frames.shape[2] % SPATIAL_MULTIPLE):
+        # With resize_mode='none' the frames keep their own size, and that -- not the
+        # width/height widgets -- is what Sample must be told to generate at.
+        t, height, width = int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2])
+        if height % SPATIAL_MULTIPLE or width % SPATIAL_MULTIPLE:
             raise ValueError(
                 f"ComfyUI-DiffHDR: resize_mode='none' but the incoming frames are "
-                f"{frames.shape[2]}x{frames.shape[1]}, which is not a multiple of "
-                f"{SPATIAL_MULTIPLE}."
+                f"{width}x{height}, which is not a multiple of {SPATIAL_MULTIPLE}."
             )
+        user = self._conform_mask(mask, t, height, width, resize_mode)
+        use_under = use_under_exposure_mask and mode != "panorama"
 
-        srgb = colour.image_to_chw(frames).float()  # (T,3,H,W), sRGB in [0,1]
-        t = srgb.shape[0]
-
-        combined, overs, unders = [], [], []
+        # Frame at a time, into preallocated outputs. The maths is elementwise or
+        # per-frame already, so this is identical to doing it on the whole clip, but
+        # peak memory is one extra frame rather than several extra copies of the clip
+        # -- which on a long 720p plate is tens of GB.
+        log_video = torch.empty((t, 3, height, width), dtype=torch.float32)
+        overs = torch.empty((t, height, width), dtype=torch.float32)
+        unders = torch.empty_like(overs)
+        finals = torch.empty_like(overs)
+        pil_masks = []
         prev_over = prev_under = None
-        conditioning = srgb.clone()
 
         for i in range(t):
-            f = srgb[i]
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            f = frames[i, :, :, :3].permute(2, 0, 1).float().contiguous()  # (3,H,W) sRGB
             if mode == "panorama":
                 # Different maths on purpose -- the Pano LoRA was trained with it.
                 over = colour.overexposure_mask_pano(f, over_threshold)
@@ -304,22 +343,41 @@ class DiffHDREncode:
                     over, prev_over = colour.stabilize_soft_mask(over, prev_over, 0.7, 9, 9)
                     under, prev_under = colour.stabilize_soft_mask(under, prev_under, 0.7, 9, 9)
 
-            over_bin = (over > 0.2).float()
-            under_bin = (under > 0.2).float()
-            if use_under_exposure_mask and mode != "panorama":
-                combined_bin = torch.logical_or(over_bin.bool(), under_bin.bool()).float()
+            over_bin = over > 0.2
+            under_bin = under > 0.2
+            final = (over_bin | under_bin) if use_under else over_bin
+            if user is not None:
+                u = user[i if user.shape[0] > 1 else 0]
+                if mask_mode == "replace":
+                    final = u
+                elif mask_mode == "subtract":
+                    final = final & ~u
+                else:
+                    final = final | u
+            if use_under:
                 # Upstream replaces crushed pixels with mid-grey so the model is not
-                # anchored to the (meaningless) clipped-black values it would otherwise see.
-                conditioning[i][under_bin.unsqueeze(0).repeat(3, 1, 1) == 1.0] = 0.5
-            else:
-                combined_bin = over_bin
+                # anchored to the (meaningless) clipped-black values it would otherwise
+                # see. Only where the model is actually told to reconstruct: grey left
+                # in a region the user subtracted would be kept as grey.
+                fill = under_bin & final
+                if bool(fill.any()):
+                    f = f.clone()  # never write through to the incoming IMAGE
+                    f[:, fill] = 0.5
 
-            combined.append(combined_bin)
-            overs.append(over_bin)
-            unders.append(under_bin)
+            # sRGB -> linear -> log. This is the signal the model was trained on.
+            log_video[i] = colour.lin_to_log(colour.srgb_to_linear(f))
+            overs[i] = over_bin
+            unders[i] = under_bin
+            finals[i] = final
+            pil_masks.append(_mask_to_pil(finals[i]))  # what diffsynth's VACE unit wants
 
-        coverage = float(torch.stack(combined).mean())
-        if coverage < 1e-5:
+        coverage = float(finals.mean()) if t else 0.0
+        if coverage < 1e-5 and user is not None:
+            logger.warning(
+                "ComfyUI-DiffHDR: the mask is empty after applying your mask "
+                "(mask_mode=%s). The model will have nothing to reconstruct.", mask_mode,
+            )
+        elif coverage < 1e-5:
             logger.warning(
                 "ComfyUI-DiffHDR: the exposure mask is empty -- no pixel in this plate "
                 "reads as clipped at over_threshold=%.3f. The model will have nothing to "
@@ -329,20 +387,34 @@ class DiffHDREncode:
             )
         logger.info("ComfyUI-DiffHDR: mask covers %.2f%% of pixels over %d frame(s)", coverage * 100.0, t)
 
-        # sRGB -> linear -> log. This is the signal the model was trained on.
-        log_video = colour.lin_to_log(colour.srgb_to_linear(conditioning))
-
         cond = {
-            "log_video": log_video,                       # (T,3,H,W) float, log space
-            "masks": [_mask_to_pil(m) for m in combined],  # what diffsynth's VACE unit wants
+            "log_video": log_video,  # (T,3,H,W) float, log space
+            "masks": pil_masks,
             "height": height,
             "width": width,
             "mode": mode,
             "frames": t,
         }
-        over_stack = torch.stack(overs)    # (T,H,W) -- ComfyUI MASK layout
-        under_stack = torch.stack(unders)
-        return (cond, over_stack, under_stack)
+        return (cond, overs, unders, finals)  # masks in ComfyUI MASK layout, (T,H,W)
+
+    @staticmethod
+    def _conform_mask(mask, t, height, width, resize_mode):
+        """A user MASK -> ``(1 or T, H, W)`` bool, conformed exactly like the frames."""
+        if mask is None:
+            return None
+        m = mask if mask.ndim == 3 else mask.reshape(1, *mask.shape[-2:])
+        if m.shape[0] not in (1, t):
+            raise ValueError(
+                f"ComfyUI-DiffHDR: the mask has {m.shape[0]} frames but the images have "
+                f"{t}. Supply one mask for every frame, or a single mask for all of them."
+            )
+        m = _crop_and_resize(m.float().unsqueeze(-1), height, width, resize_mode)[..., 0]
+        if tuple(m.shape[1:]) != (height, width):
+            raise ValueError(
+                f"ComfyUI-DiffHDR: the mask is {m.shape[2]}x{m.shape[1]} but the frames "
+                f"are {width}x{height}. With resize_mode='none' they must match."
+            )
+        return m > 0.5
 
 
 class DiffHDRSample:
@@ -381,14 +453,25 @@ class DiffHDRSample:
                     "1.0 disables classifier-free guidance, which is what upstream uses "
                     "and halves the work. Above 1.0 doubles the cost per step and tends "
                     "to exaggerate the invented highlights."}),
-                "seed": ("INT", {"default": 10, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "seed": ("INT", {"default": 10, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                    # ComfyUI adds a randomize-after-run control to any input called
+                    # 'seed'. Here that would re-run the most expensive node in the
+                    # graph on every queue (a changed seed defeats ComfyUI's cache) and
+                    # give a different reconstruction of the same shot each time.
+                    "control_after_generate": "fixed",
+                    "tooltip": "Upstream uses 10. Fixed by default so re-queuing the "
+                               "graph reuses the cached result and re-renders are "
+                               "reproducible."}),
                 "sigma_shift": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 20.0, "step": 0.1,
                     "tooltip": "Flow-match schedule shift. 5.0 is upstream's default for Wan2.1."}),
                 "window_size": ("INT", {"default": TRAINED_FRAMES, "min": 1, "max": 257, "step": 4,
                     "tooltip":
                     "Frames per diffusion pass; rounded up to 4k+1. 33 is the trained "
                     "length. Clips longer than this are processed as overlapping windows "
-                    "and cross-faded."}),
+                    "and cross-faded.\n\n"
+                    "This is also the VRAM control: it caps the tokens per pass, and it "
+                    "caps how many times a still is replicated. On a 24 GB card at "
+                    "1280x720 use 9."}),
                 "window_stride": ("INT", {"default": 16, "min": 1, "max": 256, "tooltip":
                     "Step between windows for long clips. The overlap "
                     "(window_size - stride) is the cross-fade length: wider overlap costs "
@@ -430,12 +513,11 @@ class DiffHDRSample:
     def sample(self, pipeline, conditioning, prompt, negative_prompt, steps, cfg_scale,
                seed, sigma_shift, window_size, window_stride, use_prev_window_reference,
                tea_cache, tiled_vae, reference_image=None, reference_ev=5.0):
-        pipe = pipeline.pipe
-        device = pipe.device
         height, width = conditioning["height"], conditioning["width"]
         log_video = conditioning["log_video"]
         masks = conditioning["masks"]
         total = conditioning["frames"]
+        mode = conditioning["mode"]
 
         window_size = _round_frames(window_size)
         if window_stride > window_size:
@@ -444,28 +526,76 @@ class DiffHDRSample:
                 f"window_size ({window_size}) -- that would leave gaps between windows."
             )
 
-        ref = None
-        if reference_image is not None:
-            ref = self._prepare_reference(reference_image, masks[0], height, width,
-                                          reference_ev, device)
+        # ComfyUI does not manage this pipeline, so it will not make room for it on
+        # its own. Move whatever ComfyUI still has resident (a previous workflow's
+        # model, say) off the card first -- ComfyUI reloads it on demand. DiffHDR's
+        # 'auto' VRAM budget is measured from device-wide free memory, so this also
+        # buys it more resident DiT blocks rather than just avoiding an OOM.
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        pipe = pipeline.pipe  # rebuilds transparently if it was released
+        device = pipe.device
 
-        # One frame in: a still (replicated to the trained token count, as upstream
-        # does) or a panorama (a genuine single frame).
+        def reference_for(mask):
+            if reference_image is None:
+                return None
+            return self._prepare_reference(reference_image, mask, height, width,
+                                           reference_ev, device)
+
+        if mode == "panorama":
+            windows = None
+            passes = total
+        elif total == 1:
+            windows = None
+            passes = 1
+        else:
+            windows = plan(total, window_size, window_stride)
+            passes = len(windows)
+        # One bar for the whole job, not one that restarts for every window.
+        pbar = comfy.utils.ProgressBar(steps * passes)
+        done = [0]
+
+        def run(frames, mask_list, ref, n, label):
+            out = self._run(pipe, frames, mask_list, ref, prompt, negative_prompt, steps,
+                            cfg_scale, seed, sigma_shift, height, width, n, tiled_vae,
+                            tea_cache, label=label,
+                            progress=(pbar, done[0] * steps, steps * passes))
+            done[0] += 1
+            return out
+
+        if mode == "panorama":
+            # Every frame is its own panorama, run as one genuine frame. The Pano LoRA
+            # was trained on single frames; a batch of HDRIs is not a clip, and sending
+            # it down the temporal path would ask the model to make unrelated
+            # panoramas agree with each other.
+            outs = []
+            for i in range(total):
+                out = run(log_video[i:i + 1], [masks[i]], reference_for(masks[i]), 1,
+                          label=f"panorama {i + 1}/{total}")
+                outs.append(self._to_linear(out[:1]))
+            return (torch.cat(outs),)
+
+        ref = reference_for(masks[0])
+
         if total == 1:
-            n = 1 if conditioning["mode"] == "panorama" else _frames_for_still(height, width)
-            logger.info("ComfyUI-DiffHDR: single frame, running as %d frame(s)", n)
-            out = self._run(pipe, log_video.expand(n, -1, -1, -1), [masks[0]] * n, ref,
-                            prompt, negative_prompt, steps, cfg_scale, seed, sigma_shift,
-                            height, width, n, tiled_vae, tea_cache, label="still")
+            # A still is replicated to the token count the model was trained on, as
+            # upstream does -- but never past window_size. At 1280x720 the trained
+            # count is 33 frames, which is 32,400 tokens and does not fit on a 24 GB
+            # card; window_size is the VRAM control everywhere else, so it is here too.
+            want = _frames_for_still(height, width)
+            n = min(want, window_size)
+            if n < want:
+                logger.info("ComfyUI-DiffHDR: still replicated to %d frames (window_size "
+                            "caps it; the trained token count would be %d)", n, want)
+            else:
+                logger.info("ComfyUI-DiffHDR: single frame, running as %d frame(s)", n)
+            out = run(log_video.expand(n, -1, -1, -1), [masks[0]] * n, ref, n, label="still")
             return (self._to_linear(out[:1]),)
 
-        windows = plan(total, window_size, window_stride)
         if len(windows) == 1:
             n = _round_frames(total)
             frames, mask_list = self._pad(log_video, masks, n)
-            out = self._run(pipe, frames, mask_list, ref, prompt, negative_prompt, steps,
-                            cfg_scale, seed, sigma_shift, height, width, n, tiled_vae,
-                            tea_cache, label="clip")
+            out = run(frames, mask_list, ref, n, label="clip")
             return (self._to_linear(out[:total]),)
 
         logger.info(
@@ -482,10 +612,8 @@ class DiffHDRSample:
             if w["pad"]:
                 chunk = torch.cat([chunk, chunk[-1:].repeat(w["pad"], 1, 1, 1)])
                 chunk_masks = chunk_masks + [chunk_masks[-1]] * w["pad"]
-            out_log = self._run(pipe, chunk, chunk_masks, window_ref, prompt,
-                                negative_prompt, steps, cfg_scale, seed, sigma_shift,
-                                height, width, window_size, tiled_vae, tea_cache,
-                                label=f"window {i + 1}/{len(windows)}")
+            out_log = run(chunk, chunk_masks, window_ref, window_size,
+                          label=f"window {i + 1}/{len(windows)}")
             acc.add(w, self._to_linear(out_log))
 
             if use_prev_window_reference:
@@ -529,12 +657,16 @@ class DiffHDRSample:
 
     def _run(self, pipe, log_frames, mask_list, ref, prompt, negative_prompt, steps,
              cfg_scale, seed, sigma_shift, height, width, num_frames, tiled_vae,
-             tea_cache=0.0, label=""):
-        """One diffusion pass. Returns (T,H,W,C) float in LOG space on the pipeline device."""
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        pbar = comfy.utils.ProgressBar(steps)
+             tea_cache=0.0, label="", progress=None):
+        """One diffusion pass. Returns (T,H,W,C) float in LOG space on the pipeline device.
 
-        def progress(iterable):
+        ``progress`` is ``(ProgressBar, offset, total)`` so several passes can share one
+        bar; ``None`` gives this pass a bar of its own.
+        """
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        pbar, offset, total = progress or (comfy.utils.ProgressBar(steps), 0, steps)
+
+        def progress_bar_cmd(iterable):
             """Drive ComfyUI's progress bar from the sampler loop, and allow cancelling.
 
             The pipeline takes a ``progress_bar_cmd`` hook, so this reports real
@@ -543,9 +675,9 @@ class DiffHDRSample:
             """
             for i, item in enumerate(iterable):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                pbar.update_absolute(i, steps)
+                pbar.update_absolute(offset + i, total)
                 yield item
-            pbar.update_absolute(steps, steps)
+            pbar.update_absolute(offset + steps, total)
 
         t0 = time.perf_counter()
         logger.info("ComfyUI-DiffHDR: sampling %s -- %d frames at %dx%d, %d steps",
@@ -573,7 +705,7 @@ class DiffHDRSample:
                 # DiT and the nearest calibration available.
                 tea_cache_l1_thresh=(float(tea_cache) if tea_cache > 0 else None),
                 tea_cache_model_id="Wan2.1-T2V-14B",
-                progress_bar_cmd=progress,
+                progress_bar_cmd=progress_bar_cmd,
             )
 
         out = torch.stack(video)                 # (T,H,W,C), log space, unquantised
@@ -596,30 +728,42 @@ class DiffHDRFreeMemory:
     """Drop the cached pipeline to reclaim VRAM."""
 
     DESCRIPTION = (
-        "Releases the cached DiffHDR pipeline. Only needed when you want the VRAM back "
-        "without restarting ComfyUI -- the loader already keeps at most one resident."
+        "Releases the cached DiffHDR pipeline. Only needed when you want the memory "
+        "back without restarting ComfyUI -- the loader already keeps at most one "
+        "resident. Wire the Sample output through 'images' so it runs after sampling; "
+        "the next run reloads the pipeline automatically."
     )
     CATEGORY = "DiffHDR"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("status",)
+    # `images` was appended after the first release; outputs are addressed by slot
+    # index in saved workflows, so new ones only ever go on the end.
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("status", "images")
     FUNCTION = "free"
     OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"trigger": ("BOOLEAN", {"default": True})}}
+        return {
+            "required": {"trigger": ("BOOLEAN", {"default": True, "tooltip":
+                "Off makes this node a no-op without removing it from the graph."})},
+            "optional": {"images": ("IMAGE", {"tooltip":
+                "Pass-through, and the reason this input exists: it is what orders the "
+                "release AFTER sampling. With nothing connected this node has no "
+                "dependencies, and ComfyUI runs output nodes like it first -- before the "
+                "pipeline is even used."})},
+        }
 
     @classmethod
-    def IS_CHANGED(cls, trigger):
+    def IS_CHANGED(cls, **kwargs):
         return float("nan")  # always run: the point is the side effect
 
-    def free(self, trigger):
+    def free(self, trigger, images=None):
         if not trigger:
-            return ("skipped",)
+            return ("skipped", images)
         from .diffhdr_runtime import runtime
 
         runtime.free()
-        return ("DiffHDR pipeline released",)
+        return ("DiffHDR pipeline released", images)
 
 
 NODE_CLASS_MAPPINGS = {

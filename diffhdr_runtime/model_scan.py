@@ -102,8 +102,14 @@ def list_candidates(role: str) -> list[str]:
     """
     if folder_paths is None:
         return []
+    # Current ComfyUI maps the legacy names "unet" -> "diffusion_models" and
+    # "clip" -> "text_encoders", so scanning both spellings (kept for older installs)
+    # would list every file twice under two labels. Dedupe on the canonical folder
+    # name rather than on each file's real path: that would be a stat per file on
+    # every /object_info, which on an NFS LoRA library is a visible stall.
+    canonical = getattr(folder_paths, "map_legacy", lambda f: f)
     out: list[str] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for folder in _ROLE_FOLDERS.get(role, ()):  # preference order
         try:
             names = folder_paths.get_filename_list(folder)
@@ -112,10 +118,10 @@ def list_candidates(role: str) -> list[str]:
         for n in names:
             if not n.lower().endswith(_EXTS):
                 continue
-            label = f"{folder}/{n}"
-            if label not in seen:
-                seen.add(label)
-                out.append(label)
+            key = (canonical(folder), n)
+            if key not in seen:
+                seen.add(key)
+                out.append(f"{folder}/{n}")
     return out
 
 
@@ -278,27 +284,46 @@ def validate(path: str, expect: str, role: str) -> None:
 
 _TOKENIZER_MARKERS = ("spiece.model", "tokenizer.json", "tokenizer_config.json")
 
+# Folders whose registered paths are searched for a tokenizer as well as models/
+# itself. Registered paths are where extra_model_paths.yaml points ComfyUI, which on a
+# studio install is usually a shared library outside models/ altogether.
+_TOKENIZER_FOLDERS = ("diffhdr", "text_encoders", "diffusion_models", "checkpoints")
+
+
+def _tokenizer_roots() -> list[str]:
+    roots = [_models_dir()]
+    for folder in _TOKENIZER_FOLDERS:
+        try:
+            roots.extend(folder_paths.get_folder_paths(folder))
+        except Exception:
+            continue
+    return roots
+
 
 def find_tokenizers() -> list[str]:
-    """Locate ``google/umt5-xxl`` tokenizer directories already present under models/.
+    """Locate ``google/umt5-xxl`` tokenizer directories already present on disk.
 
     The tokenizer is ~5 MB and ships inside the official Wan repos, so on any machine
     that has ever staged a full Wan checkout it is already on disk -- worth finding
     rather than downloading again.
+
+    Symlinks are followed (model folders are very often symlinks into a shared
+    library), with each real directory visited once so a link cycle cannot loop.
     """
     found: list[str] = []
     seen: set[str] = set()
-    roots = [_models_dir()]
-    for root in roots:
+    visited: set[str] = set()
+    for root in _tokenizer_roots():
         if not os.path.isdir(root):
             continue
-        for dirpath, dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+            real = os.path.realpath(dirpath)
             # Depth guard: the asset library is large and on NFS.
-            if dirpath[len(root):].count(os.sep) > 4:
+            if real in visited or dirpath[len(root):].count(os.sep) > 4:
                 dirnames[:] = []
                 continue
+            visited.add(real)
             if any(m in filenames for m in _TOKENIZER_MARKERS) and "umt5" in dirpath.lower():
-                real = os.path.realpath(dirpath)
                 if real not in seen:
                     seen.add(real)
                     found.append(dirpath)
