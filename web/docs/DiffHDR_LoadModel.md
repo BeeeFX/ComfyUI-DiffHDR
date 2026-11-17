@@ -30,19 +30,30 @@ Two independent controls:
 
 **`dit_dtype`** — the precision the DiT is loaded at.
 
-* `bf16` — reference behaviour, ~34 GB.
-* `fp8_e4m3fn` — roughly halves that to ~17 GB by casting on load. The usual choice on
-  a 24–32 GB card.
+* `bf16` — reference behaviour. DiT + VACE weights: 32.3 GiB.
+* `fp8_e4m3fn` — halves that to 16.2 GiB by casting on load. The usual choice on a
+  24–32 GB card.
+* `fp16` — no saving over bf16. The model always *computes* in bf16, so the weights are
+  cast to bf16 as each layer runs, and the result is bit-identical to `bf16` except on
+  LoRA-merged layers, where merging at fp16 before that final rounding is a sub-ULP
+  more precise. Invisible in practice, and it costs a cast per layer per step under
+  `full_gpu`. Use `bf16`.
 
-This casts the ordinary fp16 file. Pre-quantised `*_fp8_scaled` repacks carry extra
+fp8 casts the ordinary fp16 file. Pre-quantised `*_fp8_scaled` repacks carry extra
 per-tensor scale tensors that change the key set, so they cannot be identified and are
 rejected — use the plain file and set this widget instead.
 
 **`vram_mode`** — where the weights live during sampling.
 
-* `auto` — upstream's default. Budgets from total VRAM and streams DiT blocks from
-  system RAM. Works nearly everywhere.
-* `full_gpu` — keep everything resident. Fastest; needs the whole DiT in VRAM.
+* `auto` — upstream's default. Moves blocks onto the GPU until it is nearly full and
+  streams the rest from system RAM every step. Works nearly everywhere. Note that the
+  blocks it keeps on the GPU are upcast to bf16 whatever `dit_dtype` is, so fp8 halves
+  the system-RAM copy, not what `auto` keeps on the card.
+* `full_gpu` — keep everything resident, in the loaded dtype (cast to bf16 per layer
+  as it runs), and never stream. Fastest. At fp8 that is 16.2 GiB of weights, which
+  should leave room for activations on a 24 GB card at the token budget in the
+  README — expected, not yet measured. The Sample node logs peak VRAM per pass, so
+  running one job tells you.
 * `streaming` — as `auto` but with an explicit budget from `vram_limit_gb`, for when
   you are sharing the card.
 
@@ -98,6 +109,11 @@ One pipeline is held at a time, and it is released *before* a replacement is bui
 two 14 B models are never resident at once. Changing any widget rebuilds it. That
 includes `lora_strength`, because the LoRA is merged into the weights rather than
 applied as a patch.
+
+Two Load Model nodes in one graph (say, the video and the Pano LoRA) therefore take
+turns: each Sample rebuilds its own pipeline if the other loader has taken the slot.
+That is correct but costs a full load each time, so prefer one loader per graph. The
+same automatic rebuild happens after DiffHDR Free Memory.
 
 ## If the LoRA fails to attach
 

@@ -443,6 +443,9 @@ class WanVideoPipeline(BasePipeline):
                 ),
             )
         if self.vace is not None:
+            # [ComfyUI-DiffHDR] Upstream read `dtype` left over from whichever block ran
+            # last (the VAE's -- fp32 in ComfyUI-DiffHDR), upcasting VACE to fp32 on onload.
+            dtype = next(iter(self.vace.parameters())).dtype
             device = "cpu" if vram_limit is not None else self.device
             enable_vram_management(
                 self.vace,

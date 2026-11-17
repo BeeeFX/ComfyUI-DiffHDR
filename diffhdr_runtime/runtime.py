@@ -28,9 +28,10 @@ from . import model_scan, vendor
 logger = logging.getLogger("ComfyUI-DiffHDR")
 
 # One resident pipeline, ever. Evicted before the replacement is built so the two
-# never overlap in VRAM.
+# never overlap in VRAM. Values are ``(pipe, lora_merged, speed_merged)``; nothing else
+# in the process holds a reference to the pipe, so eviction really frees it.
 _CACHE_LOCK = threading.Lock()
-_CACHE: "OrderedDict[tuple, DiffHDRPipeline]" = OrderedDict()
+_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _CACHE_MAX = 1
 
 DTYPES = {
@@ -45,44 +46,42 @@ VRAM_MODES = ("auto", "full_gpu", "streaming")
 class DiffHDRPipeline:
     """Opaque handle passed down the graph on the DIFFHDR_PIPELINE wire.
 
-    Eviction drops ``_pipe`` rather than relying on the handle itself becoming
-    unreachable: ComfyUI caches node outputs, so it keeps its own reference to this
-    object, and letting go of ours alone would free no VRAM at all. Access goes through
-    a property so a handle that outlives its pipeline reports what happened instead of
-    surfacing as an ``AttributeError`` on ``None``.
+    The handle holds the *recipe* for a pipeline -- resolved paths and settings -- and
+    never the pipeline itself; ``pipe`` looks it up in the module cache and rebuilds it
+    if it is gone. Both halves of that matter, because ComfyUI caches node outputs:
+
+    * ComfyUI keeps its own reference to this handle, so if the handle held the
+      pipeline, evicting it from our cache would free no memory at all;
+    * ComfyUI will not re-run the Load Model node while its widgets are unchanged, so
+      a handle that could only report "released" (after DiffHDR Free Memory, or after
+      a second loader evicted it) would fail every run until the user touched a
+      loader widget. Rebuilding on demand is what ComfyUI's own model management does
+      for unloaded models, too.
     """
 
-    def __init__(self, pipe, key, lora_name, matched, speed_lora=None, speed_matched=0):
-        self._pipe = pipe
+    def __init__(self, key, build_args: dict):
         self.key = key
-        self.lora_name = lora_name
-        self.lora_modules_merged = matched
-        self.speed_lora = speed_lora
-        self.speed_modules_merged = speed_matched
+        self._build_args = build_args
+        self.lora_name = os.path.basename(build_args["lora_path"])
+        speed_path = build_args.get("speed_path")
+        self.speed_lora = os.path.basename(speed_path) if speed_path else None
+        self.lora_modules_merged = 0
+        self.speed_modules_merged = 0
+        self._built = False
 
     @property
     def pipe(self):
-        if self._pipe is None:
-            raise RuntimeError(
-                "ComfyUI-DiffHDR: this pipeline has been released (a different model "
-                "was loaded, or DiffHDR Free Memory ran). Re-run the DiffHDR Load Model "
-                "node -- it is cached, so this is cheap if nothing changed."
-            )
-        return self._pipe
+        return _acquire(self)
 
     @property
     def released(self) -> bool:
-        return self._pipe is None
-
-    def release(self):
-        self._pipe = None
+        """True if the next ``pipe`` access will have to rebuild."""
+        return self.key not in _CACHE
 
     def __repr__(self):
-        if self._pipe is None:
-            return f"<DiffHDRPipeline lora={self.lora_name!r} released>"
+        state = "released" if self.released else f"merged={self.lora_modules_merged}"
         extra = f" speed={self.speed_lora!r}/{self.speed_modules_merged}" if self.speed_lora else ""
-        return (f"<DiffHDRPipeline lora={self.lora_name!r} "
-                f"merged={self.lora_modules_merged}{extra}>")
+        return f"<DiffHDRPipeline lora={self.lora_name!r} {state}{extra}>"
 
 
 def _read_lora(path: str) -> dict:
@@ -273,11 +272,34 @@ def _evict_all():
     while _CACHE:
         key, old = _CACHE.popitem(last=False)
         logger.info("ComfyUI-DiffHDR: evicting cached pipeline %s", key[0] if key else "")
-        old.release()
         del old
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _acquire(handle: DiffHDRPipeline):
+    """Return the pipeline for ``handle``, building it (and evicting any other) if needed."""
+    with _CACHE_LOCK:
+        entry = _CACHE.get(handle.key)
+        if entry is None:
+            if handle._built:
+                logger.info(
+                    "ComfyUI-DiffHDR: pipeline was released (DiffHDR Free Memory ran, or "
+                    "another loader took its place) -- rebuilding it"
+                )
+            if len(_CACHE) >= _CACHE_MAX:
+                # Evict first: building the replacement while the old one is resident
+                # would need twice the memory, which is exactly what this cache exists
+                # to avoid.
+                _evict_all()
+            entry = _build(**handle._build_args)
+            _CACHE[handle.key] = entry
+        else:
+            _CACHE.move_to_end(handle.key)
+        pipe, handle.lora_modules_merged, handle.speed_modules_merged = entry
+        handle._built = True
+        return pipe
 
 
 def load_pipeline(
@@ -320,29 +342,25 @@ def load_pipeline(
         os.path.realpath(speed_path) if speed_path else None,
         round(float(speed_lora_strength), 6) if speed_path else None,
     )
+    handle = DiffHDRPipeline(key, dict(
+        dit_path=dit_path, t5_path=t5_path, vae_path=vae_path, tok_path=tok_path,
+        lora_path=lora_path, lora_strength=float(lora_strength), dit_dtype=dit_dtype,
+        vram_mode=vram_mode, vram_limit_gb=float(vram_limit_gb),
+        speed_path=speed_path, speed_strength=float(speed_lora_strength),
+    ))
 
-    with _CACHE_LOCK:
-        hit = _CACHE.get(key)
-        if hit is not None:
-            _CACHE.move_to_end(key)
-            logger.info("ComfyUI-DiffHDR: reusing cached pipeline")
-            return hit
-
-        # Evict first: building the replacement while the old one is resident would
-        # need twice the VRAM, which is exactly what this cache exists to avoid.
-        if len(_CACHE) >= _CACHE_MAX:
-            _evict_all()
-
-        built = _build(dit_path, t5_path, vae_path, tok_path, lora_path,
-                       float(lora_strength), dit_dtype, vram_mode, float(vram_limit_gb), key,
-                       speed_path, float(speed_lora_strength))
-        _CACHE[key] = built
-        return built
+    if not handle.released:
+        logger.info("ComfyUI-DiffHDR: reusing cached pipeline")
+    # Build now rather than on first use, so the load cost lands on the Load Model
+    # node where the user expects it, and a bad file fails there too.
+    _acquire(handle)
+    return handle
 
 
 def _build(dit_path, t5_path, vae_path, tok_path, lora_path,
-           lora_strength, dit_dtype, vram_mode, vram_limit_gb, key,
-           speed_path=None, speed_strength=1.0) -> DiffHDRPipeline:
+           lora_strength, dit_dtype, vram_mode, vram_limit_gb,
+           speed_path=None, speed_strength=1.0):
+    """Build one pipeline. Returns ``(pipe, lora_modules_merged, speed_modules_merged)``."""
     WanVideoPipeline, ModelConfig = vendor.pipeline_classes()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_dtype = torch.bfloat16
@@ -411,11 +429,10 @@ def _build(dit_path, t5_path, vae_path, tok_path, lora_path,
         time.perf_counter() - t0, matched,
         f", speed LoRA -> {speed_matched}" if speed_path else "",
     )
-    return DiffHDRPipeline(pipe, key, os.path.basename(lora_path), matched,
-                           os.path.basename(speed_path) if speed_path else None, speed_matched)
+    return pipe, matched, speed_matched
 
 
 def free():
-    """Drop the cached pipeline (used by the loader's ``free_memory`` toggle)."""
+    """Drop the cached pipeline (DiffHDR Free Memory). Handles rebuild it on next use."""
     with _CACHE_LOCK:
         _evict_all()
